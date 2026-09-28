@@ -1,0 +1,39 @@
+# Секреты
+.env
+
+# База и файлы данных
+bot.db
+bot.db-journal
+targets.json
+muted.json
+targets.json.tmp
+muted.json.tmp
+
+# Временные файлы
+temp_*.jpg
+*.jpg
+*.jpeg
+*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
