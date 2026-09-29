@@ -8,6 +8,9 @@ targets.json
 muted.json
 targets.json.tmp
 muted.json.tmp
+chats.json
+chats.json.tmp
+
 
 # Временные файлы
 temp_*.jpg

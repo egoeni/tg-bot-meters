@@ -22,11 +22,26 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 
+DEBUG_DIR = "debug"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
 
 # Конфигурация
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # ограничения на /list_targets
+_raw_allowed = os.getenv("ALLOWED_USERS", "") # ограничения на /set, временная переменная
+ALLOWED_USERS = {
+    int(x.strip())
+    for x in _raw_allowed.split(",")
+    if x.strip().isdigit()
+}
+# Проверка, что настройки заданы
+if not ADMIN_ID:
+    raise RuntimeError("ADMIN_ID не задан в .env")
+if not ALLOWED_USERS:
+    raise RuntimeError("ALLOWED_USERS не задан в .env (через запятую)")
 
 DB_PATH = "bot.db"
 
@@ -51,6 +66,7 @@ def init_db():
             name       TEXT NOT NULL,
             serial     TEXT,
             unit       TEXT DEFAULT 'м³',
+            features   TEXT,
             int_digits INTEGER DEFAULT 5,
             active     INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -79,6 +95,28 @@ def init_db():
             ON tariffs(meter_id, valid_from);
         """)
 init_db()
+
+
+# ---------- chats.json ----------
+CHATS_FILE = "chats.json"
+def get_chats() -> dict:
+    if os.path.exists(CHATS_FILE):
+        try:
+            with open(CHATS_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    return {}
+                return json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            print(f"⚠️ {CHATS_FILE} повреждён — сбрасываю")
+            return {}
+    return {}
+
+def save_chats(chats: dict):
+    tmp = CHATS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(chats, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CHATS_FILE)
 
 
 # ---------- targets.json ----------
@@ -124,6 +162,7 @@ def save_muted(muted: set):# атомарная запись с защитой
         json.dump(sorted(muted), f, ensure_ascii=False, indent=2)
     os.replace(tmp, MUTED_FILE)
 
+
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -146,6 +185,73 @@ async def cmd_start(message: Message):
         "• или просто отправьте фото с показаниями счётчика и я их сохраню"
     )
 
+@dp.my_chat_member()
+async def on_my_chat_member(update):
+    """
+    Ловит изменения статуса бота в чате.
+    Записывает все чаты, куда добавили бота, в chats.json.
+    """
+    chat = update.chat
+    cid = str(chat.id)
+    title = chat.title or chat.full_name or "Личный чат"
+    status = update.new_chat_member.status
+
+    chats = get_chats()
+
+    if status in ("member", "administrator", "creator"):
+        # Бота добавили или повысили
+        if cid not in chats:
+            print(f"[chats] Бот добавлен в чат: {title} ({cid})")
+        chats[cid] = {
+            "title": title,
+            "type": chat.type,
+            "status": status,
+            "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        save_chats(chats)
+
+    elif status in ("left", "kicked"):
+        # Бота удалили
+        if cid in chats:
+            print(f"[chats] Бот удалён из чата: {title} ({cid})")
+            chats[cid]["status"] = "left"
+            chats[cid]["left_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            save_chats(chats)
+
+@dp.message(Command("chats"))
+async def cmd_chats(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Команда только для администратора.")
+        return
+
+    chats = get_chats()
+    if not chats:
+        await message.answer("Бот пока нигде не зафиксирован.")
+        return
+
+    # Активные чаты (status = member/admin/creator)
+    active = []
+    left = []
+
+    for cid, info in chats.items():
+        status = info.get("status", "unknown")
+        title = info.get("title", "—")
+        ctype = info.get("type", "—")
+        line = f"• <b>{title}</b>\n  <code>{cid}</code> ({ctype}, {status})"
+
+        if status in ("member", "administrator", "creator"):
+            active.append(line)
+        else:
+            left.append(line)
+
+    text = ""
+    if active:
+        text += "✅ <b>Активные чаты:</b>\n" + "\n".join(active) + "\n\n"
+    if left:
+        text += "❌ <b>Бот удалён:</b>\n" + "\n".join(left)
+
+    await message.answer(text, parse_mode="HTML")
+
 @dp.message(Command("mute"))
 async def cmd_mute(message: Message):
     cid = str(message.chat.id)
@@ -164,6 +270,9 @@ async def cmd_unmute(message: Message):
 
 @dp.message(Command("list_targets"))# перечень активированных чатов\n"
 async def cmd_list_targets(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Этот бот приватный, обратитесь к администратору.")
+        return
     targets = get_targets()
     if not targets:
         await message.answer("Активных чатов для напоминаний нет.")
@@ -174,6 +283,9 @@ async def cmd_list_targets(message: Message):
 # ---------- Управление чатом ----------
 @dp.message(Command("set"))
 async def cmd_set(message: Message):
+    if message.from_user.id not in ALLOWED_USERS:
+        await message.answer("Этот бот приватный, обратитесь к администратору")
+        return
     cid = str(message.chat.id)
     title = message.chat.title or message.chat.full_name or "Личный чат"
     #активация чата в JSON
@@ -272,7 +384,7 @@ async def cmd_last(message: Message):
             LEFT JOIN (
                 SELECT meter_id, value, created_at,
                        ROW_NUMBER() OVER (PARTITION BY meter_id
-                                          ORDER BY created_at DESC) AS rn
+                                          ORDER BY period DESC, created_at DESC) AS rn
                 FROM readings
             ) r ON r.meter_id = m.id AND r.rn = 1
             WHERE m.chat_id = ? AND m.active = 1
@@ -378,10 +490,10 @@ def preprocess_photo(path: str): # оптимизация изображения
     img = Image.open(path)
     img.thumbnail((1280, 1280))
     img = img.convert("L") # Конвертация в градации серого
-    img = ImageEnhance.Contrast(img).enhance(1.8) # Повышение контраста
+    img = ImageEnhance.Contrast(img).enhance(1.5) # Повышение контраста
     img = ImageEnhance.Sharpness(img).enhance(1.5) # Лёгкая резкость
     img = ImageOps.autocontrast(img, cutoff=1) # Автоконтраст — растягивает гистограмму
-    img.save(path, quality=90)
+    img.save(path, quality=95)
 
 def normalize_serial(s: str) -> str:# нормализация серийника счетчика
     if not s:
@@ -390,7 +502,8 @@ def normalize_serial(s: str) -> str:# нормализация серийник�
 
 def parse_gigachat_response(raw: str):# парсер ответа гигачата
     serial = None
-    value = None
+    digits_str = None
+    matched_name = None
 
     m = re.search(r"SERIAL\s*[:\-]?\s*(.+)", raw, re.IGNORECASE)
     if m:
@@ -402,11 +515,15 @@ def parse_gigachat_response(raw: str):# парсер ответа гигачат
     if m:
         digits_raw = m.group(1).replace(" ", "").replace(",", ".")
         int_part = digits_raw.split(".")[0]
-        digits = re.sub(r"\D", "", int_part)
-        if digits:
-            value = int(digits)
+        digits_str = re.sub(r"\D", "", int_part)
 
-    return serial, value
+    m = re.search(r"MATCH\s*[:\-]?\s*(.+)", raw, re.IGNORECASE)
+    if m:
+        s = m.group(1).strip()
+        if s and s.upper() != "UNKNOWN":
+            matched_name = s
+
+    return serial, digits_str, matched_name
 
 # ---------- расчетные функции  ----------
 def get_current_reading(meter_id: int, period: str):# возвращает показаняи счетчика в периоде
@@ -468,30 +585,49 @@ async def cleanup_pending():# Удаляет устаревшие pending-зап
     if removed:
         print(f"[cleanup] Удалено устаревших записей: {removed}")
 
-async def recognize_photo_gigachat(file_id: str, cid: str, message_id: int):# Jтправляет в GigaChat. Возвращает (serial_norm, value, raw)
+async def recognize_photo_gigachat(file_id: str, cid: str, message_id: int, meters: list):# Jтправляет в GigaChat. Возвращает (serial_norm, value, raw)
     file_info = await bot.get_file(file_id)
     temp_file = f"temp_{cid}_{message_id}.jpg"
     await bot.download_file(file_info.file_path, temp_file)
     preprocess_photo(temp_file)
 
+    # --- ОТЛАДКА: сохраняем копию перед отправкой в GigaChat ---
+    #debug_file = os.path.join(DEBUG_DIR, f"debug_{cid}_{message_id}.jpg")
+    #try:
+    #    import shutil
+    #    shutil.copy(temp_file, debug_file)
+    #    print(f"[debug] Фото сохранено: {debug_file}")
+    #except Exception as e:
+    #    print(f"[debug] Не удалось сохранить копию: {e}")
+    # --- конец отладки ---
+
     serial_norm = None
-    value = None
+    digits_str = None
+    matched_name = None
     raw = ""
 
     try:
         with GigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
             with open(temp_file, "rb") as f:
                 uploaded = client.upload_file(f)
-
+           
+            # Формируем список описаний для модели
+            meters_desc = "\n".join(
+                f"- {name}: {features or 'описание отсутствует'}"
+                for _, name, _, _, _, features in meters
+            )
             prompt = (
-                "На фото счётчик. Сначала внимательно прочитай показания"
-                "они расположены по центру счётчика (целая часть и дробная отделенная точкой), "
-                "затем, если видно, заводской номер на корпусе.\n\n"
+                "На фото счётчик учёта. Выполни три задачи:\n"
+                "1. Прочитай показания — цифры на барабане.\n"
+                "2. Если видно, прочитай заводской номер на корпусе.\n"
+                "3. Определи, к какому счётчику из списка относится фото — "
+                "по внешним признакам (маркировка, бренд).\n\n"
+                "Известные счётчики:\n"
+                f"{meters_desc}\n\n"
                 "Ответ передай строго по форме:\n"
-                "VALUE: <цифры показаний>\n"
-                "SERIAL: <номер или UNKNOWN>\n\n"
-                "Если показания не видно — VALUE: UNKNOWN.\n"
-                "SERIAL — вторичное. Если номер не виден или стёрт — SERIAL: UNKNOWN."
+                "VALUE: <цифры показаний или UNKNOWN>\n"
+                "SERIAL: <номер или UNKNOWN>\n"
+                "MATCH: <точное название счётчика из списка или UNKNOWN>\n\n"
             )
             chat = Chat(
                 model="GigaChat-2-Pro",
@@ -509,30 +645,43 @@ async def recognize_photo_gigachat(file_id: str, cid: str, message_id: int):# J�
 
         if content:
             raw = content.strip()
-            serial_norm, value = parse_gigachat_response(raw)
-
+            serial_norm, digits_str, matched_name = parse_gigachat_response(raw)
+            
     except Exception as e:
         print(f"Ошибка автоопределения: {e}")
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)
-    return serial_norm, value, raw
+    return serial_norm, digits_str, matched_name, raw
 
-def find_meter_by_serial(serial_norm: str, meters):# Ищет счётчик по норм. серийному номеру. Возвращает (mid, name, unit)
+def find_meter_by_serial(serial_norm: str, meters):# Ищет счётчик по норм. серийному номеру
     if not serial_norm:
         return None
-    for mid, name, unit, serial in meters:
-        if serial and normalize_serial(serial) == serial_norm:
-            return mid, name, unit
+    for row in meters:
+        # row = (id, name, unit, serial, int_digits, features)
+        serial_db = row[3]
+        if serial_db and normalize_serial(serial_db) == serial_norm:
+            return row
     return None
 
-def build_meters_keyboard(cid: str, meters) -> InlineKeyboardMarkup:# Клавиатура выбора счётчика, когда автоопред.не сработало
+def find_meter_by_name(matched_name: str, meters):# Ищет по визуальному совпадению
+    if not matched_name:
+        return None
+    matched_lower = matched_name.lower()
+    for row in meters:
+        # row[1] = name
+        name = row[1].lower()
+        if name == matched_lower or name in matched_lower or matched_lower in name:
+            return row
+    return None
+
+def build_meters_keyboard(cid: str, meters) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(
-            text=f"{name} ({unit})",
-            callback_data=f"mtr:{cid}:{mid}",
+            text=f"{row[1]} ({row[2]})",
+            callback_data=f"mtr:{cid}:{row[0]}",
         )]
-        for mid, name, unit, serial in meters
+        for row in meters
     ]
     buttons.append([InlineKeyboardButton(
         text="❌ Отменить",
@@ -603,8 +752,8 @@ async def handle_photo(message: Message):
     # Счётчики — из БД
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "SELECT id, name, unit, serial FROM meters "
-            "WHERE chat_id = ? AND active = 1 ORDER BY id",
+            "SELECT id, name, unit, serial, int_digits, features "
+            "FROM meters WHERE chat_id = ? AND active = 1 ORDER BY id",
             (cid,),
         )
         meters = cur.fetchall()
@@ -615,34 +764,45 @@ async def handle_photo(message: Message):
     await delete_old_confirmation(cid)
     # Скачиваем и распознаём
     file_id = message.photo[-1].file_id
-    status_msg = await message.answer("🔍 Определяю счётчик по номеру…")
-    serial_norm, value, raw = await recognize_photo_gigachat(file_id, cid, message.message_id)
-    # Ищем счётчик по номеру
+    status_msg = await message.answer("🔍 Определяю счётчик…")
+    serial_norm, digits_str, matched_name, raw = await recognize_photo_gigachat(
+        file_id, cid, message.message_id, meters
+    )
+    
+    # Определяем счётчик: серийник → визуальные признаки
     matched = find_meter_by_serial(serial_norm, meters)
-    if matched and value is not None:
-        mid, name, unit = matched
-        await ask_confirmation_photo(
-            cid, mid, name, unit, value, raw, file_id,
-            message.from_user.id, status_msg,
-        )
-        return
+    if not matched:
+        matched = find_meter_by_name(matched_name, meters)
+
+    # Если нашли и цифры есть — подтверждение
+    if matched and digits_str:
+        mid, name, unit, serial, int_digits, features = matched
+
+        if len(digits_str) > int_digits:
+            digits_str = digits_str[:int_digits]
+
+        value = int(digits_str) if digits_str else None
+        if value is not None:
+            await ask_confirmation_photo(
+               cid, mid, name, unit, value, raw, file_id,
+               message.from_user.id, status_msg,
+            )
+            return
+
     # Fallback — выбор счётчика кнопкой
     await status_msg.delete()
+
     pending_photos[cid] = {
         "file_id": file_id,
         "chat_id": cid,
         "user_id": message.from_user.id,
         "ts": datetime.now(),
         "raw": raw,
-        "value": value,
+        "digits_str": digits_str,
     }
-    hint = ""
-    if serial_norm and not matched:
-        hint = f"\n⚠️ Номер <code>{serial_norm}</code> не найден в БД."
-    elif not serial_norm:
-        hint = "\n⚠️ Не удалось прочитать номер с фото."
+
     await message.answer(
-        f"К какому счётчику относится фото?{hint}",
+        "К какому счётчику относится фото?",
         reply_markup=build_meters_keyboard(cid, meters),
     )
     
@@ -658,6 +818,7 @@ async def cb_meter_chosen(call: CallbackQuery):
     cid = parts[1]
     meter_id = int(parts[2])
 
+    # Забираем данные из pending
     data = pending_photos.pop(cid, None)
     if not data:
         await call.answer("Фото устарело — отправьте заново", show_alert=True)
@@ -665,24 +826,36 @@ async def cb_meter_chosen(call: CallbackQuery):
         return
 
     file_id = data["file_id"]
-
+    # ← СНАЧАЛА читаем счётчик из БД
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "SELECT name, unit FROM meters WHERE id = ?", (meter_id,)
+            "SELECT name, unit, int_digits FROM meters WHERE id = ?",
+            (meter_id,),
         )
         row = cur.fetchone()
+
     if not row:
         await call.answer("Счётчик не найден", show_alert=True)
         return
-    meter_name, unit = row
+    #определяем переменные
+    meter_name, unit, int_digits = row
 
-    # Если показания уже распознаны при автоопределении — сохраняем сразу
-    if data.get("value") is not None:
-        value = data["value"]
-        raw = data.get("raw", "")
-        await ask_confirmation(call, cid, meter_id, meter_name, unit, value, raw, file_id, call.from_user.id)
-        return
-    # Иначе — модель не увидела показания при первой попытке
+    # Обрезаем digits_str по int_digits и считаем value
+    digits_str = data.get("digits_str")
+    if digits_str:
+        if len(digits_str) > int_digits:
+            digits_str = digits_str[:int_digits]
+        value = int(digits_str) if digits_str else None
+
+        if value is not None:
+            raw = data.get("raw", "")
+            await ask_confirmation(
+                call, cid, meter_id, meter_name, unit,
+                value, raw, file_id, call.from_user.id,
+            )
+            return
+
+    # Если сюда дошли — показаний нет
     await call.message.edit_text(
         "⚠️ Не удалось распознать показания на фото.\n"
         "Сфотографируйте счётчик крупнее, чётче и при хорошем свете — "
@@ -805,6 +978,10 @@ async def handle_manual_input(message: Message):
 # ---------- Прочие команды ----------
 @dp.message(Command("joke"))
 async def cmd_joke(message: Message):
+    cid = str(message.chat.id)
+    if cid not in get_targets():
+        await message.answer("Сначала активируйте помощника: /set")
+        return
     await message.answer("Придумываю шутку...")
     try:
         with GigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
