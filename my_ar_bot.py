@@ -10,6 +10,8 @@ import os
 import re
 import sqlite3
 import json
+import glob
+
 
 from datetime import datetime
 
@@ -22,8 +24,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
 
-DEBUG_DIR = "debug"
-os.makedirs(DEBUG_DIR, exist_ok=True)
+#DEBUG_DIR = "debug"
+#os.makedirs(DEBUG_DIR, exist_ok=True)
 
 
 # Конфигурация
@@ -37,21 +39,20 @@ ALLOWED_USERS = {
     for x in _raw_allowed.split(",")
     if x.strip().isdigit()
 }
-# Проверка, что настройки заданы
-if not ADMIN_ID:
+
+if not ADMIN_ID:# Проверка, что настройки заданы
     raise RuntimeError("ADMIN_ID не задан в .env")
 if not ALLOWED_USERS:
     raise RuntimeError("ALLOWED_USERS не задан в .env (через запятую)")
 
 DB_PATH = "bot.db"
-
 DEFAULT_METERS = [
-    ("hvs",      "ХВС",         "м³",    5),
-    ("gvs",      "ГВС",         "м³",    5),
-    ("el_day",   "Эл-во день",  "кВт·ч", 5),
-    ("el_night", "Эл-во ночь",  "кВт·ч", 5),
-    ("gaz",      "Газ",         "м³",    6),
-    ("heat",     "Тепло",       "Гкал",  6),
+    ("hvs",      "ХВС",         "м³",    5,   0),
+    ("gvs",      "ГВС",         "м³",    5,   0),
+    ("el_day",   "Эл-во день",  "кВт·ч", 5,   0),
+    ("el_night", "Эл-во ночь",  "кВт·ч", 5,   0),
+    ("gaz",      "Газ",         "м³",    6,   0),
+    ("heat",     "Тепло",       "Гкал",  6,   3),
 ]
 
 
@@ -68,6 +69,7 @@ def init_db():
             unit       TEXT DEFAULT 'м³',
             features   TEXT,
             int_digits INTEGER DEFAULT 5,
+            decimal_digits INTEGER DEFAULT 0,
             active     INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(chat_id, code)
@@ -268,7 +270,7 @@ async def cmd_unmute(message: Message):
     save_muted(muted)
     await message.answer("🔔 Напоминания включены.")
 
-@dp.message(Command("list_targets"))# перечень активированных чатов\n"
+@dp.message(Command("list_targets"))
 async def cmd_list_targets(message: Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Этот бот приватный, обратитесь к администратору.")
@@ -295,12 +297,12 @@ async def cmd_set(message: Message):
     #создание стандартного набора счетчиков
     added = []
     with sqlite3.connect(DB_PATH) as conn:
-        for code, name, unit, int_digits in DEFAULT_METERS:
+        for code, name, unit, int_digits, decimal_digits in DEFAULT_METERS:
             try:
                 conn.execute(
-                    "INSERT INTO meters (chat_id, code, name, unit, int_digits) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (cid, code, name, unit, int_digits),
+                    "INSERT INTO meters (chat_id, code, name, unit, int_digits, decimal_digits) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (cid, code, name, unit, int_digits, decimal_digits),
                 )
                 added.append(name)
             except sqlite3.IntegrityError:
@@ -379,7 +381,7 @@ async def cmd_last(message: Message):
     cid = str(message.chat.id)
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute("""
-            SELECT m.name, m.unit, r.value, r.created_at
+            SELECT m.name, m.unit, m.decimal_digits, r.value, r.created_at
             FROM meters m
             LEFT JOIN (
                 SELECT meter_id, value, created_at,
@@ -395,12 +397,13 @@ async def cmd_last(message: Message):
         await message.answer("Нет счётчиков.")
         return
     lines = []
-    for name, unit, value, dt in rows:
+    for name, unit, decimal_digits, value, dt in rows:
         if value is None:
             lines.append(f"• <b>{name}</b>: нет данных")
         else:
             d = datetime.fromisoformat(dt).strftime("%d.%m.%Y")
-            lines.append(f"• <b>{name}</b>: {int(value)} {unit} (от {d})")
+            display = format_value(value, decimal_digits)
+            lines.append(f"• <b>{name}</b>: {display} {unit} (от {d})")
     await message.answer("Последние показания:\n" + "\n".join(lines),
                          parse_mode="HTML")
 
@@ -419,7 +422,7 @@ async def cmd_report(message: Message):
 
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "SELECT id, name, unit FROM meters "
+            "SELECT id, name, unit, decimal_digits FROM meters "
             "WHERE chat_id = ? AND active = 1 ORDER BY id",
             (cid,),
         )
@@ -433,7 +436,7 @@ async def cmd_report(message: Message):
     total = 0.0
     has_consumption = False
 
-    for mid, name, unit in meters:
+    for mid, name, unit, dec_d in meters:
         current = get_current_reading(mid, period)
         previous = get_previous_reading(mid, period)
 
@@ -444,7 +447,7 @@ async def cmd_report(message: Message):
         if not previous:
             lines.append(
                 f"🔹 <b>{name}</b>\n"
-                f"   текущее: {int(current[0])} {unit}\n"
+                f"   текущее: {format_value(current[0], dec_d)} {unit}\n"
                 f"   ⚠️ нет предыдущих показаний для расчёта\n"
             )
             continue
@@ -454,26 +457,41 @@ async def cmd_report(message: Message):
         if consumption < 0:
             lines.append(
                 f"🔹 <b>{name}</b>\n"
-                f"   {int(previous[0])} → {int(current[0])}\n"
+                f"   {format_value(previous[0], dec_d)} → {format_value(current[0], dec_d)}\n"
                 f"   ⚠️ показания уменьшились, проверьте\n"
             )
             continue
 
         has_consumption = True
-        rate = get_tariff(mid, period)
-
-        if rate:
-            cost = consumption * rate
+        tariff = get_tariff(mid, period)
+        if tariff:
+            rate, mult_voda, extra_coef, podogrev_gvs = tariff
+            cost = consumption * rate * mult_voda + consumption * podogrev_gvs
             total += cost
-            lines.append(
+            cons_str = format_value(consumption, dec_d)
+            header = (
                 f"🔹 <b>{name}</b>\n"
-                f"   {int(previous[0])} → {int(current[0])} = {int(consumption)} {unit}\n"
-                f"   {int(consumption)} × {rate:.2f} ₽ = <b>{cost:.2f} ₽</b>\n"
+                f"   {format_value(previous[0], dec_d)} → {format_value(current[0], dec_d)} "
+                f"= {cons_str} {unit}\n"
             )
+            # Формируем формулу одной строкой
+            if mult_voda == 1: # Обычный счётчик: расход × тариф
+                formula = f"{cons_str} × {rate:.2f} ₽"
+            elif mult_voda == 2 and extra_coef == 0: # ХВС: расход × тариф × множитель
+                formula = f"{cons_str} × {rate:.2f} ₽ × {mult_voda:.0f}"
+            else: # ГВС: вода + водоотведение + подогрев
+                formula = (
+                    f"{cons_str} × ({rate:.2f} ₽ × {mult_voda:.0f} "
+                    f"+ {podogrev_gvs:.2f} ₽)"
+                )
+
+            lines.append(header + f"   {formula} = <b>{cost:.2f} ₽</b>\n")
+
         else:
             lines.append(
                 f"🔹 <b>{name}</b>\n"
-                f"   {int(previous[0])} → {int(current[0])} = {int(consumption)} {unit}\n"
+                f"   {format_value(previous[0], dec_d)} → {format_value(current[0], dec_d)} "
+                f"= {format_value(consumption, dec_d)} {unit}\n"
                 f"   ⚠️ тариф не задан (см. таблицу tariffs)\n"
             )
 
@@ -481,7 +499,6 @@ async def cmd_report(message: Message):
         lines.append(f"💰 <b>Итого: {total:.2f} ₽</b>")
 
     await message.answer("\n".join(lines), parse_mode="HTML")
-
 
 
 # ---------- работа с фото и ручным вводом ----------
@@ -502,7 +519,7 @@ def normalize_serial(s: str) -> str:# нормализация серийник�
 
 def parse_gigachat_response(raw: str):# парсер ответа гигачата
     serial = None
-    digits_str = None
+    value_str = None
     matched_name = None
 
     m = re.search(r"SERIAL\s*[:\-]?\s*(.+)", raw, re.IGNORECASE)
@@ -513,17 +530,41 @@ def parse_gigachat_response(raw: str):# парсер ответа гигачат
 
     m = re.search(r"VALUE\s*[:\-]?\s*([\d.,]+)", raw, re.IGNORECASE)
     if m:
-        digits_raw = m.group(1).replace(" ", "").replace(",", ".")
-        int_part = digits_raw.split(".")[0]
-        digits_str = re.sub(r"\D", "", int_part)
+        value_str = m.group(1).strip().replace(" ", "")
+        value_str = re.sub(r"[^\d.,]", "", value_str)
 
     m = re.search(r"MATCH\s*[:\-]?\s*(.+)", raw, re.IGNORECASE)
     if m:
         s = m.group(1).strip()
         if s and s.upper() != "UNKNOWN":
             matched_name = s
+    return serial, value_str, matched_name
 
-    return serial, digits_str, matched_name
+def parse_value(value_str: str, decimal_digits: int): # Превращает строку VALUE в число. При decimal_digits=0 отбрасывает дробь
+    if not value_str:
+        return None
+    normalized = value_str.replace(",", ".").strip()
+    normalized = re.sub(r"[^\d.]", "", normalized)
+    if normalized.count(".") > 1:
+        parts = normalized.split(".")
+        normalized = parts[0] + "." + "".join(parts[1:])
+    if not normalized:
+        return None
+    try:
+        value = float(normalized)
+    except ValueError:
+        return None
+    if decimal_digits == 0:
+        return float(int(value))
+    return value
+
+def format_value(value, decimal_digits: int) -> str: # Форматирует число для отображения
+    if value is None:
+        return "—"
+    if decimal_digits == 0:
+        return str(int(value))
+    return f"{value:.{decimal_digits}f}"
+
 
 # ---------- расчетные функции  ----------
 def get_current_reading(meter_id: int, period: str):# возвращает показаняи счетчика в периоде
@@ -550,13 +591,13 @@ def get_tariff(meter_id: int, period: str):# возвращает тариф с 
     end_date = f"{period}-99"   # строка заведомо больше любого реального дня
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "SELECT rate FROM tariffs "
+            "SELECT rate, mult_voda, extra_coef, podogrev_gvs FROM tariffs "
             "WHERE meter_id = ? AND valid_from <= ? "
             "ORDER BY valid_from DESC LIMIT 1",
             (meter_id, end_date),
         )
         row = cur.fetchone()
-        return row[0] if row else None
+        return row if row else None
 
 
 # ---------- Обработчики  ----------
@@ -574,7 +615,6 @@ async def cleanup_pending():# Удаляет устаревшие pending-зап
                 del store[key]
                 removed += 1
      # Уборка сиротских temp-файлов старше 1 часа
-    import glob
     for f in glob.glob("temp_*.jpg"):
         try:
             if os.path.getmtime(f) < now.timestamp() - 3600:
@@ -602,7 +642,7 @@ async def recognize_photo_gigachat(file_id: str, cid: str, message_id: int, mete
     # --- конец отладки ---
 
     serial_norm = None
-    digits_str = None
+    value_str = None
     matched_name = None
     raw = ""
 
@@ -614,20 +654,19 @@ async def recognize_photo_gigachat(file_id: str, cid: str, message_id: int, mete
             # Формируем список описаний для модели
             meters_desc = "\n".join(
                 f"- {name}: {features or 'описание отсутствует'}"
-                for _, name, _, _, _, features in meters
+                for _, name, _, _, features, _ in meters
             )
             prompt = (
-                "На фото счётчик учёта. Выполни три задачи:\n"
-                "1. Прочитай показания — цифры на барабане.\n"
-                "2. Если видно, прочитай заводской номер на корпусе.\n"
-                "3. Определи, к какому счётчику из списка относится фото — "
-                "по внешним признакам (маркировка, бренд).\n\n"
+                "На фото счётчик учёта. Прочитай показания и определи, "
+                "какой это счётчик из списка.\n\n"
                 "Известные счётчики:\n"
                 f"{meters_desc}\n\n"
-                "Ответ передай строго по форме:\n"
-                "VALUE: <цифры показаний или UNKNOWN>\n"
+                "Ответ строго в трёх строках:\n"
+                "VALUE: <цифры показаний, как на дисплее. Если есть точка или "
+                "запятая — включи её. Без пробелов и букв.>\n"
                 "SERIAL: <номер или UNKNOWN>\n"
-                "MATCH: <точное название счётчика из списка или UNKNOWN>\n\n"
+                "MATCH: <точное название из списка или UNKNOWN>"
+
             )
             chat = Chat(
                 model="GigaChat-2-Pro",
@@ -645,20 +684,21 @@ async def recognize_photo_gigachat(file_id: str, cid: str, message_id: int, mete
 
         if content:
             raw = content.strip()
-            serial_norm, digits_str, matched_name = parse_gigachat_response(raw)
+            serial_norm, value_str, matched_name = parse_gigachat_response(raw)
+            #Отладка
+            #print(f"[gigachat] SERIAL={serial_norm}, VALUE={value_str}, MATCH={matched_name}")
             
     except Exception as e:
         print(f"Ошибка автоопределения: {e}")
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)
-    return serial_norm, digits_str, matched_name, raw
+    return serial_norm, value_str, matched_name, raw
 
 def find_meter_by_serial(serial_norm: str, meters):# Ищет счётчик по норм. серийному номеру
     if not serial_norm:
         return None
     for row in meters:
-        # row = (id, name, unit, serial, int_digits, features)
         serial_db = row[3]
         if serial_db and normalize_serial(serial_db) == serial_norm:
             return row
@@ -669,7 +709,6 @@ def find_meter_by_name(matched_name: str, meters):# Ищет по визуаль
         return None
     matched_lower = matched_name.lower()
     for row in meters:
-        # row[1] = name
         name = row[1].lower()
         if name == matched_lower or name in matched_lower or matched_lower in name:
             return row
@@ -697,24 +736,26 @@ async def delete_old_confirmation(cid: str):# Удаляет старое соо
         except Exception:
             pass
 
-async def ask_confirmation_photo(cid, mid, name, unit, value, raw, file_id, user_id, status_msg):# Показывает подтверждение
+async def ask_confirmation_photo(cid, mid, name, unit, value, raw, file_id, user_id, status_msg, decimal_digits=0):# Показывает подтверждение
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Верно", callback_data=f"cfm:yes:{cid}"),
         InlineKeyboardButton(text="❌ Неверно", callback_data=f"cfm:no:{cid}"),
     ]])
+    display = format_value(value, decimal_digits)
     sent = await status_msg.edit_text(
-        f"📊 <b>{name}</b>: {value} {unit}\n\nСохранить?",
+        f"📊 <b>{name}</b>: {display} {unit}\n\nСохранить?",
         parse_mode="HTML",
         reply_markup=kb,
     )
     pending_confirmations[cid] = {
         "meter_id": mid, "meter_name": name, "unit": unit,
         "value": value, "raw": raw, "file_id": file_id, "user_id": user_id,
+        "decimal_digits": decimal_digits,
         "ts": datetime.now(),
         "message_id": sent.message_id,
     }
 
-async def ask_confirmation(message_or_call, cid, meter_id, meter_name, unit, value, raw, file_id, user_id):
+async def ask_confirmation(message_or_call, cid, meter_id, meter_name, unit, value, raw, file_id, user_id, decimal_digits=0):
     """
     Универсальное подтверждение:
       - CallbackQuery → редактирует сообщение с кнопками
@@ -724,7 +765,8 @@ async def ask_confirmation(message_or_call, cid, meter_id, meter_name, unit, val
         InlineKeyboardButton(text="✅ Верно", callback_data=f"cfm:yes:{cid}"),
         InlineKeyboardButton(text="❌ Неверно", callback_data=f"cfm:no:{cid}"),
     ]])
-    text = f"📊 <b>{meter_name}</b>: {value} {unit}\n\nСохранить?"
+    display = format_value(value, decimal_digits)   # ← добавили
+    text = f"📊 <b>{meter_name}</b>: {display} {unit}\n\nСохранить?"
 
     if isinstance(message_or_call, CallbackQuery):
         sent = await message_or_call.message.edit_text(
@@ -738,6 +780,7 @@ async def ask_confirmation(message_or_call, cid, meter_id, meter_name, unit, val
     pending_confirmations[cid] = {
         "meter_id": meter_id, "meter_name": meter_name, "unit": unit,
         "value": value, "raw": raw, "file_id": file_id, "user_id": user_id,
+        "decimal_digits": decimal_digits,
         "ts": datetime.now(),
         "message_id": sent.message_id,
     }
@@ -752,7 +795,7 @@ async def handle_photo(message: Message):
     # Счётчики — из БД
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "SELECT id, name, unit, serial, int_digits, features "
+            "SELECT id, name, unit, serial, features, decimal_digits "
             "FROM meters WHERE chat_id = ? AND active = 1 ORDER BY id",
             (cid,),
         )
@@ -765,7 +808,7 @@ async def handle_photo(message: Message):
     # Скачиваем и распознаём
     file_id = message.photo[-1].file_id
     status_msg = await message.answer("🔍 Определяю счётчик…")
-    serial_norm, digits_str, matched_name, raw = await recognize_photo_gigachat(
+    serial_norm, value_str, matched_name, raw = await recognize_photo_gigachat(
         file_id, cid, message.message_id, meters
     )
     
@@ -775,17 +818,14 @@ async def handle_photo(message: Message):
         matched = find_meter_by_name(matched_name, meters)
 
     # Если нашли и цифры есть — подтверждение
-    if matched and digits_str:
-        mid, name, unit, serial, int_digits, features = matched
+    if matched and value_str:
+        mid, name, unit, serial, features, decimal_digits = matched
+        value = parse_value(value_str, decimal_digits)
 
-        if len(digits_str) > int_digits:
-            digits_str = digits_str[:int_digits]
-
-        value = int(digits_str) if digits_str else None
         if value is not None:
             await ask_confirmation_photo(
-               cid, mid, name, unit, value, raw, file_id,
-               message.from_user.id, status_msg,
+                cid, mid, name, unit, value, raw, file_id,
+                message.from_user.id, status_msg, decimal_digits,
             )
             return
 
@@ -798,7 +838,7 @@ async def handle_photo(message: Message):
         "user_id": message.from_user.id,
         "ts": datetime.now(),
         "raw": raw,
-        "digits_str": digits_str,
+        "value_str": value_str,
     }
 
     await message.answer(
@@ -829,7 +869,7 @@ async def cb_meter_chosen(call: CallbackQuery):
     # ← СНАЧАЛА читаем счётчик из БД
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "SELECT name, unit, int_digits FROM meters WHERE id = ?",
+            "SELECT name, unit, decimal_digits FROM meters WHERE id = ?",
             (meter_id,),
         )
         row = cur.fetchone()
@@ -838,20 +878,17 @@ async def cb_meter_chosen(call: CallbackQuery):
         await call.answer("Счётчик не найден", show_alert=True)
         return
     #определяем переменные
-    meter_name, unit, int_digits = row
+    meter_name, unit, decimal_digits  = row
 
-    # Обрезаем digits_str по int_digits и считаем value
-    digits_str = data.get("digits_str")
-    if digits_str:
-        if len(digits_str) > int_digits:
-            digits_str = digits_str[:int_digits]
-        value = int(digits_str) if digits_str else None
-
+    # Парсим значение с учётом decimal_digits
+    value_str = data.get("value_str")
+    if value_str:
+        value = parse_value(value_str, decimal_digits)
         if value is not None:
             raw = data.get("raw", "")
             await ask_confirmation(
                 call, cid, meter_id, meter_name, unit,
-                value, raw, file_id, call.from_user.id,
+                value, raw, file_id, call.from_user.id, decimal_digits,
             )
             return
 
@@ -865,7 +902,6 @@ async def cb_meter_chosen(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("man:"))# Функция ручного заполнения
 async def cb_manual_meter(call: CallbackQuery):
     parts = call.data.split(":")
-
     if parts[1] == "cancel":
         cid = parts[2]
         pending_manual.pop(cid, None)
@@ -946,66 +982,50 @@ async def cb_confirm(call: CallbackQuery):
             ),
         )
 
+    display = format_value(data["value"], data.get("decimal_digits", 0))
     await call.message.edit_text(
-        f"✅ Сохранено: <b>{data['meter_name']}: {data['value']} {data['unit']}</b>",
+        f"✅ Сохранено: <b>{data['meter_name']}: {display} {data['unit']}</b>",
         parse_mode="HTML",
     )
 
 @dp.message(F.text & ~F.text.startswith("/"))# Текстовый обработчик ручного воода
 async def handle_manual_input(message: Message):
     cid = str(message.chat.id)
-    data = pending_manual.get(cid)   # ← .get, не .pop
+    data = pending_manual.get(cid)
     if not data:
-        return   # не в процессе ручного ввода — игнорируем
+        return
+
     text = message.text.strip()
     cleaned = text.replace(" ", "").replace(",", ".")
-    digits = re.sub(r"\D", "", cleaned.split(".")[0])
 
-    if not digits:
-        await message.answer("⚠️ Введите только цифры, например: 7764")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        await message.answer("⚠️ Введите число, например: 1234.56 или 1234")
         return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "SELECT decimal_digits FROM meters WHERE id = ?",
+            (data["meter_id"],),
+        )
+        row = cur.fetchone()
+    decimal_digits = row[0] if row else 0
+
+    if decimal_digits == 0:
+        value = float(int(value))
 
     pending_manual.pop(cid, None)
     # Переиспользуем ask_confirmation
     await ask_confirmation(
         message, cid,
         data["meter_id"], data["meter_name"], data["unit"],
-        int(digits), "manual", "",
-        message.from_user.id,
+        value, "manual", "",
+        message.from_user.id, decimal_digits,
     )
 
 
 # ---------- Прочие команды ----------
-@dp.message(Command("joke"))
-async def cmd_joke(message: Message):
-    cid = str(message.chat.id)
-    if cid not in get_targets():
-        await message.answer("Сначала активируйте помощника: /set")
-        return
-    await message.answer("Придумываю шутку...")
-    try:
-        with GigaChat(credentials=GIGACHAT_CREDENTIALS, verify_ssl_certs=False) as client:
-            prompt = (
-                "Придумай ОДНУ короткую позитивную шутку про молодоженов"
-                "В качестве имени мужа используй - Денис, жена - Катя"
-                "Главная роль в шутке чередуется"
-            )
-            chat = Chat(
-                model="GigaChat-2",
-                messages=[
-                    Messages(
-                        role=MessagesRole.USER,
-                        content=prompt,
-                    )
-                ],
-            )
-            response = client.chat(chat)
-            content = response.choices[0].message.content.strip()
-        await message.answer(content)
-
-    except Exception as e:
-        await message.answer(f"❌ Не получилось: {e}")
-
 
 # ---------- Планировщик ----------
 async def send_daily_reminder():#Типовая функция рассылки
