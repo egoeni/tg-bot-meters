@@ -12,7 +12,6 @@ import sqlite3
 import json
 import glob
 
-
 from datetime import datetime
 
 from PIL import Image, ImageEnhance, ImageOps
@@ -23,9 +22,6 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineK
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages, MessagesRole
-
-#DEBUG_DIR = "debug"
-#os.makedirs(DEBUG_DIR, exist_ok=True)
 
 
 # Конфигурация
@@ -179,6 +175,7 @@ async def cmd_start(message: Message):
         "• /set — активировать меня в этом чате\n"
         "• /stop — деактивировать меня в этом чате\n"
         "• /meters — список счётчиков\n"
+        "• /tarifs — действующие тарифы\n"
         "• /last — последние показания\n"
         "• /report — отчет за текущий месяц\n"
         "• /mute — приостановить отправку напоминаний\n"        
@@ -342,6 +339,57 @@ async def cmd_meters(message: Message):
         lines.append(f"• <b>{name}</b> — код <code>{code}</code>, {unit}{s}")
     await message.answer("Счётчики:\n" + "\n".join(lines), parse_mode="HTML")
 
+@dp.message(Command("tarifs"))
+async def cmd_tarifs(message: Message):
+    cid = str(message.chat.id)
+    current_period = datetime.now().strftime("%Y-%m")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "SELECT id, name, unit, code FROM meters "
+            "WHERE chat_id = ? AND active = 1 ORDER BY id",
+            (cid,),
+        )
+        meters = cur.fetchall()
+    if not meters:
+        await message.answer("Счётчиков не зарегистрировано")
+        return
+    lines = [f"💰 <b>Действующие тарифы</b>\n"]
+    has_any = False
+
+    for mid, name, unit, dec_d in meters:
+        tariff = get_tariff(mid, current_period)
+        if not tariff:
+            lines.append(f"🔹 <b>{name}</b>\n   ⚠️ тариф не задан\n")
+            continue
+        has_any = True
+        rate, mult_voda, extra_coef, podogrev_gvs = tariff
+
+        # Расшифровка множителя
+        if mult_voda and mult_voda > 1:
+            if mult_voda == 2:
+                mult_str = f" × {mult_voda:.0f} <i>(вода + водоотведение)</i>"
+            else:
+                mult_str = (
+                    f" × {mult_voda:.0f} "
+                    f"<i>(вода + водоотведение ×{mult_voda - 1:.0f})</i>"
+                )
+        else:
+            mult_str = ""
+        # Расшифровка подогрева
+        podogrev_str = ""
+        if podogrev_gvs and podogrev_gvs > 0:
+            podogrev_str = f" + {podogrev_gvs:.2f} ₽/{unit} <i>(подогрев)</i>"
+        # Эффективный тариф
+        effective = rate * (mult_voda or 1) + (podogrev_gvs or 0)
+        lines.append(
+            f"🔹 <b>{name}</b>\n"
+            f"   {rate:.2f} ₽/{unit}{mult_str}{podogrev_str}"
+            f" = <b>{effective:.2f} ₽/{unit}</b>\n"
+        )
+    lines.append(f"📅 Период: <code>{current_period}</code>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
 @dp.message(Command("add"))
 async def cmd_add(message: Message):
     cid = str(message.chat.id)
@@ -448,7 +496,7 @@ async def cmd_report(message: Message):
             lines.append(
                 f"🔹 <b>{name}</b>\n"
                 f"   текущее: {format_value(current[0], dec_d)} {unit}\n"
-                f"   ⚠️ нет предыдущих показаний для расчёта\n"
+                f"   нет предыдущих показаний для расчёта\n"
             )
             continue
 
